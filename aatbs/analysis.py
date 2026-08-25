@@ -432,10 +432,11 @@ def write_report_csv(report: AnalysisReport, path: Path) -> Path:
 
 def archive_log_to_run(source_csv: Path, run_dir: Path) -> Path:
     """
-    Move the original SD .csv into the run folder, keeping its filename.
+    Copy the original SD .csv into the run folder, keeping its filename.
 
-    If a file with the same name already exists and the source is different,
-    the existing file is renamed with a ``_previous`` suffix first.
+    The source file on the SD card is left in place. If a file with the same
+    name already exists in the run folder and the source is different, the
+    existing file is renamed with a ``_previous`` suffix first.
     """
     source_csv = Path(source_csv).resolve()
     run_dir = Path(run_dir).resolve()
@@ -451,7 +452,7 @@ def archive_log_to_run(source_csv: Path, run_dir: Path) -> Path:
             backup.unlink()
         dest.rename(backup)
 
-    shutil.move(str(source_csv), str(dest))
+    shutil.copy2(str(source_csv), str(dest))
     return dest
 
 

@@ -93,7 +93,7 @@ class AATBSApp(tk.Tk):
         ttk.Label(header, text="AATBS", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="PlantVillage test set → on-screen capture → SD inference import → accuracy analysis",
+            text="Class-folder dataset → on-screen capture → SD inference import → accuracy analysis",
             style="Sub.TLabel",
         ).pack(anchor="w")
 
@@ -124,9 +124,8 @@ class AATBSApp(tk.Tk):
         self.dataset_var = tk.StringVar()
         self.ipc_var = tk.StringVar(value="5")
         self.seed_var = tk.StringVar(value="42")
-        self.normalize_var = tk.BooleanVar(value=True)
 
-        ttk.Label(form, text="PlantVillage dataset folder").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(form, text="Dataset folder").grid(row=0, column=0, sticky="w", pady=4)
         ds_row = ttk.Frame(form)
         ds_row.grid(row=0, column=1, sticky="ew", pady=4)
         ttk.Entry(ds_row, textvariable=self.dataset_var, width=48).pack(side="left", fill="x", expand=True)
@@ -138,12 +137,6 @@ class AATBSApp(tk.Tk):
         ttk.Label(form, text="Random seed (optional)").grid(row=2, column=0, sticky="w", pady=4)
         ttk.Entry(form, textvariable=self.seed_var, width=10).grid(row=2, column=1, sticky="w", pady=4)
 
-        ttk.Checkbutton(
-            form,
-            text="Normalize PlantVillage folders → bacterial / fungal / healthy / pest / viral",
-            variable=self.normalize_var,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=8)
-
         form.columnconfigure(1, weight=1)
 
         btns = ttk.Frame(left)
@@ -154,6 +147,7 @@ class AATBSApp(tk.Tk):
         )
         ttk.Button(btns, text="Load existing run folder…", command=self._load_run_dialog).pack(side="left")
 
+        ttk.Label(left, text="Detected classes (from folder names)", style="Sub.TLabel").pack(anchor="w", pady=(4, 2))
         self.class_list = tk.Listbox(left, height=14, font=("Segoe UI", 10), bg="white", fg=TEXT)
         self.class_list.pack(fill="both", expand=True)
 
@@ -175,14 +169,16 @@ class AATBSApp(tk.Tk):
         self.meta_text.configure(state="disabled")
 
     def _browse_dataset(self) -> None:
-        path = filedialog.askdirectory(title="Select PlantVillage dataset folder")
+        path = filedialog.askdirectory(title="Select dataset folder")
         if path:
             self.dataset_var.set(path)
+            self._scan_dataset(announce=False)
 
-    def _scan_dataset(self) -> None:
+    def _scan_dataset(self, announce: bool = True) -> None:
         root = self.dataset_var.get().strip()
         if not root:
-            messagebox.showwarning("Dataset", "Choose a PlantVillage dataset folder first.")
+            if announce:
+                messagebox.showwarning("Dataset", "Choose a dataset folder first.")
             return
         try:
             classes = discover_classes(Path(root))
@@ -193,12 +189,13 @@ class AATBSApp(tk.Tk):
         self.class_list.delete(0, "end")
         for name, paths in sorted(classes.items()):
             self.class_list.insert("end", f"{name}  ({len(paths)} images)")
-        messagebox.showinfo("Dataset", f"Found {len(classes)} classes.")
+        if announce:
+            messagebox.showinfo("Dataset", f"Found {len(classes)} classes.")
 
     def _generate_test_set(self) -> None:
         root = self.dataset_var.get().strip()
         if not root:
-            messagebox.showwarning("Dataset", "Choose a PlantVillage dataset folder first.")
+            messagebox.showwarning("Dataset", "Choose a dataset folder first.")
             return
         try:
             ipc = int(self.ipc_var.get().strip())
@@ -213,7 +210,6 @@ class AATBSApp(tk.Tk):
                 Path(root),
                 images_per_class=ipc,
                 seed=seed,
-                use_normalized_labels=self.normalize_var.get(),
             )
             meta, run_dir, path = create_and_save_run(
                 Path(root), images, images_per_class=ipc, seed=seed
@@ -427,14 +423,6 @@ class AATBSApp(tk.Tk):
             command=self._load_old_analysis,
         ).pack(side="left", padx=8)
 
-        ttk.Label(
-            form,
-            text="SD .csv is moved into the run folder (original name). "
-            "analysis_results.csv is a separate paired ground-truth table (not a copy of the SD file).",
-            style="Sub.TLabel",
-            wraplength=980,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
-
         # Charts take most of the vertical space.
         chart_wrap = ttk.Frame(self.analysis_tab)
         chart_wrap.pack(fill="both", expand=True, pady=(6, 4))
@@ -508,7 +496,7 @@ class AATBSApp(tk.Tk):
     def _browse_sd(self) -> None:
         path = filedialog.askopenfilename(
             title="Select SD .csv (or cancel to pick a folder)",
-            filetypes=[("CSV", "*.csv"), ("All", "*.*")],
+            filetypes=[("CSV", "*.csv *.CSV"), ("All", "*.*")],
         )
         if path:
             self.sd_var.set(path)
@@ -598,7 +586,7 @@ class AATBSApp(tk.Tk):
             "Analysis complete",
             f"Overall accuracy: {report.overall_accuracy * 100:.2f}% "
             f"({report.correct}/{report.evaluated})\n"
-            f"{archived.name} moved into {run_dir.name}\n"
+            f"{archived.name} copied into {run_dir.name}\n"
             f"Saved analysis_results.csv + chart.png",
         )
 

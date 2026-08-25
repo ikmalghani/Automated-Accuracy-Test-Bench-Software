@@ -1,4 +1,4 @@
-"""PlantVillage dataset scanning and test-set sampling."""
+"""Image dataset scanning and test-set sampling."""
 
 from __future__ import annotations
 
@@ -10,9 +10,6 @@ from typing import Dict, List, Sequence
 from PIL import Image
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
-
-# Disease labels used by the ACLIS / STM32 disease model.
-DISEASE_CLASSES = ("bacterial", "fungal", "healthy", "pest", "viral")
 
 
 @dataclass
@@ -57,9 +54,9 @@ def is_readable_image(path: Path) -> bool:
 
 def discover_classes(dataset_root: Path) -> Dict[str, List[Path]]:
     """
-    Discover class folders under a PlantVillage-style root.
+    Discover class folders under a dataset root.
 
-    Supports:
+    Each subfolder name is a class. Supports:
       root/class_name/*.jpg
       root/train/class_name/*.jpg  (or val/test)
     """
@@ -90,7 +87,7 @@ def discover_classes(dataset_root: Path) -> Dict[str, List[Path]]:
 
     if not classes:
         raise ValueError(
-            "No class folders with images found. Expected PlantVillage layout:\n"
+            "No class folders with images found. Expected:\n"
             "  <dataset>/<class_name>/*.jpg\n"
             "or\n"
             "  <dataset>/train/<class_name>/*.jpg"
@@ -99,63 +96,15 @@ def discover_classes(dataset_root: Path) -> Dict[str, List[Path]]:
     return classes
 
 
-def normalize_label(class_name: str) -> str:
-    """
-    Map a PlantVillage folder name toward the 5 disease labels when possible.
-    Falls back to the folder name (lowercased) otherwise.
-    """
-    lowered = class_name.lower().replace(" ", "_").replace("-", "_")
-
-    # Exact match first.
-    if lowered in DISEASE_CLASSES:
-        return lowered
-
-    # Common PlantVillage cues (folder often looks like Crop___Disease).
-    if "healthy" in lowered:
-        return "healthy"
-    if "bacter" in lowered:
-        return "bacterial"
-    if "virus" in lowered or "viral" in lowered or "mosaic" in lowered:
-        return "viral"
-    if any(
-        tip in lowered
-        for tip in (
-            "blight",
-            "rust",
-            "scab",
-            "mildew",
-            "spot",
-            "mold",
-            "rot",
-            "anthracnose",
-            "canker",
-            "leaf_mold",
-            "septoria",
-            "alternaria",
-            "cercospora",
-            "fung",
-        )
-    ):
-        return "fungal"
-    if "pest" in lowered or "mite" in lowered or "spider" in lowered:
-        return "pest"
-
-    return lowered
-
-
 def sample_test_set(
     dataset_root: Path,
     images_per_class: int,
     seed: int | None = None,
     class_filter: Sequence[str] | None = None,
-    use_normalized_labels: bool = True,
 ) -> List[TestImage]:
     """
     Randomly sample up to `images_per_class` images from each class folder.
-
-    When `use_normalized_labels` is True, samples are grouped by normalized
-    disease label (bacterial/fungal/healthy/pest/viral) so multiple PlantVillage
-    folders that map to the same disease share one quota.
+    Class labels are the folder names.
     """
     if images_per_class < 1:
         raise ValueError("images_per_class must be >= 1")
@@ -163,13 +112,11 @@ def sample_test_set(
     rng = random.Random(seed)
     raw = discover_classes(dataset_root)
 
-    # Group source images by output label.
     grouped: Dict[str, List[Path]] = {}
     for folder_name, paths in raw.items():
-        label = normalize_label(folder_name) if use_normalized_labels else folder_name
-        if class_filter and label not in class_filter and folder_name not in class_filter:
+        if class_filter and folder_name not in class_filter:
             continue
-        grouped.setdefault(label, []).extend(paths)
+        grouped.setdefault(folder_name, []).extend(paths)
 
     if not grouped:
         raise ValueError("No classes left after filtering.")
