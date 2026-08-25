@@ -27,3 +27,6 @@ data/run*/
 # OS
 .DS_Store
 Thumbs.db
+
+# Miscellaneous
+aclis_ready_plantvillage_dataset/
