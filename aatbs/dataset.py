@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence
 
+from PIL import Image
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 # Disease labels used by the ACLIS / STM32 disease model.
@@ -39,6 +41,18 @@ class TestImage:
 
 def _is_image(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+
+
+def is_readable_image(path: Path) -> bool:
+    """True if Pillow can identify and verify the file as an image."""
+    if not _is_image(path):
+        return False
+    try:
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except OSError:
+        return False
 
 
 def discover_classes(dataset_root: Path) -> Dict[str, List[Path]]:
@@ -164,7 +178,12 @@ def sample_test_set(
     for label in sorted(grouped.keys()):
         pool = list(grouped[label])
         rng.shuffle(pool)
-        take = pool[: min(images_per_class, len(pool))]
+        take: List[Path] = []
+        for path in pool:
+            if len(take) >= images_per_class:
+                break
+            if is_readable_image(path):
+                take.append(path)
         for path in take:
             selected.append(
                 TestImage(

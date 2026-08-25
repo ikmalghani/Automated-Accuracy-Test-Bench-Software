@@ -345,7 +345,10 @@ class AATBSApp(tk.Tk):
                 self._photo = ImageTk.PhotoImage(im)
                 self.image_label.configure(image=self._photo, text="")
         except OSError as exc:
-            self.image_label.configure(image="", text=f"Could not open image:\n{path}\n{exc}")
+            self.image_label.configure(
+                image="",
+                text=f"Could not open image (corrupt or invalid file):\n{path}\n{exc}",
+            )
             self._photo = None
 
     def _persist_run(self) -> None:
