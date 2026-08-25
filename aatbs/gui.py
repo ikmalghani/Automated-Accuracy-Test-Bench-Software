@@ -308,19 +308,9 @@ class AATBSApp(tk.Tk):
         ttk.Button(controls, text="Mark captured + Next ▶", style="Accent.TButton", command=self._mark_and_next).pack(
             side="left", padx=8
         )
-        ttk.Button(controls, text="Next ▶", command=self._next_image).pack(side="left")
-        ttk.Button(controls, text="Jump to first uncaptured", command=self._jump_uncaptured).pack(side="left", padx=8)
-
-        self.fullscreen_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            controls,
-            text="Fullscreen image window (for camera)",
-            variable=self.fullscreen_var,
-            command=self._toggle_fullscreen_window,
-        ).pack(side="right")
-
-        self._fs_window: Optional[tk.Toplevel] = None
-        self._fs_label: Optional[tk.Label] = None
+        ttk.Button(controls, text="Mark as pending", command=self._mark_pending).pack(side="left")
+        ttk.Button(controls, text="Next ▶", command=self._next_image).pack(side="left", padx=8)
+        ttk.Button(controls, text="Jump to first uncaptured", command=self._jump_uncaptured).pack(side="left")
 
     def _refresh_capture_view(self) -> None:
         if not self.run or not self.run.images:
@@ -354,50 +344,9 @@ class AATBSApp(tk.Tk):
                 im.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
                 self._photo = ImageTk.PhotoImage(im)
                 self.image_label.configure(image=self._photo, text="")
-                if self._fs_window and self._fs_label:
-                    self._show_fullscreen_image(path)
         except OSError as exc:
             self.image_label.configure(image="", text=f"Could not open image:\n{path}\n{exc}")
             self._photo = None
-
-    def _toggle_fullscreen_window(self) -> None:
-        if self.fullscreen_var.get():
-            if self._fs_window is None:
-                win = tk.Toplevel(self)
-                win.title("AATBS Capture Display")
-                win.configure(bg="black")
-                win.attributes("-fullscreen", True)
-                win.bind("<Escape>", lambda _e: self._close_fullscreen())
-                label = tk.Label(win, bg="black")
-                label.pack(fill="both", expand=True)
-                self._fs_window = win
-                self._fs_label = label
-                if self.run and self.run.images:
-                    self._show_fullscreen_image(Path(self.run.images[self.current_pos].path))
-        else:
-            self._close_fullscreen()
-
-    def _close_fullscreen(self) -> None:
-        self.fullscreen_var.set(False)
-        if self._fs_window is not None:
-            self._fs_window.destroy()
-            self._fs_window = None
-            self._fs_label = None
-
-    def _show_fullscreen_image(self, path: Path) -> None:
-        if not self._fs_window or not self._fs_label:
-            return
-        try:
-            with Image.open(path) as im:
-                im = im.convert("RGB")
-                sw = self._fs_window.winfo_screenwidth()
-                sh = self._fs_window.winfo_screenheight()
-                im.thumbnail((sw, sh), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(im)
-                self._fs_label.configure(image=photo)
-                self._fs_label.image = photo  # type: ignore[attr-defined]
-        except OSError:
-            pass
 
     def _persist_run(self) -> None:
         if self.run and self.run_dir:
@@ -423,6 +372,14 @@ class AATBSApp(tk.Tk):
         self._persist_run()
         if self.current_pos < len(self.run.images) - 1:
             self.current_pos += 1
+        self._refresh_capture_view()
+
+    def _mark_pending(self) -> None:
+        if not self.run:
+            return
+        img = self.run.images[self.current_pos]
+        self.run.mark_captured(img.index, False)
+        self._persist_run()
         self._refresh_capture_view()
 
     def _jump_uncaptured(self) -> None:

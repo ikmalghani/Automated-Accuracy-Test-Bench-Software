@@ -28,7 +28,7 @@ The next folder number is `max(existing runN_*) + 1`.
 ## Workflow
 
 1. **Setup** — Point at a PlantVillage folder, set images per class, generate a test set → creates `data/runN_YYYYMMDD/metadata.json`.
-2. **Capture Display** — Show images one by one (optional fullscreen). Mark each as captured after the device photographs the screen.
+2. **Capture Display** — Show images one by one. Mark each as captured after the device photographs the screen, or mark as pending to undo a capture.
 3. **Analysis** — Point at an SD folder (or a single `.csv`). The folder must contain **exactly one** inference `.csv` (`analysis_results.csv` is ignored). That file is **moved** into the run folder with its original name. A separate `analysis_results.csv` is written as the paired accuracy table. Use **Load old analysis** to reopen a past run.
 
 ## SD CSV format
