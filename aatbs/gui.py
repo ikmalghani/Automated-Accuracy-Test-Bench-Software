@@ -452,17 +452,17 @@ class AATBSApp(tk.Tk):
         ttk.Label(right, text="Per-image results", font=("Segoe UI", 10, "bold")).pack(anchor="w")
         tree_frame = ttk.Frame(right)
         tree_frame.pack(fill="both", expand=True)
-        cols = ("index", "truth", "pred", "gate", "ok", "ms")
+        cols = ("index", "truth", "gate", "pred", "ok", "ms")
         self.result_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=8)
         headings = {
             "index": "ID",
             "truth": "Ground truth",
-            "pred": "Disease pred",
             "gate": "Gate",
+            "pred": "Disease pred",
             "ok": "Correct",
             "ms": "Infer ms",
         }
-        widths = {"index": 50, "truth": 100, "pred": 100, "gate": 70, "ok": 60, "ms": 70}
+        widths = {"index": 50, "truth": 100, "gate": 70, "pred": 100, "ok": 60, "ms": 70}
         for c in cols:
             self.result_tree.heading(c, text=headings[c])
             self.result_tree.column(c, width=widths[c], anchor="center")
@@ -525,7 +525,8 @@ class AATBSApp(tk.Tk):
             f"Run number: {meta.run_number or '?'}",
             "",
             f"OVERALL ACCURACY: {report.overall_accuracy * 100:.2f}%  "
-            f"({report.correct}/{report.evaluated} evaluated; {report.skipped} skipped)",
+            f"({report.correct}/{report.evaluated} pipeline; "
+            f"{report.skipped} gate-SKIP)",
             "",
         ]
         lines.extend(report.summary_lines())
@@ -551,9 +552,9 @@ class AATBSApp(tk.Tk):
                 values=(
                     row.index,
                     row.ground_truth,
-                    row.disease_pred,
                     row.gate_pred,
-                    "yes" if row.correct else ("skip" if row.skipped else "no"),
+                    row.disease_pred,
+                    "yes" if row.correct else "no",
                     row.infer_ms,
                 ),
             )
@@ -666,7 +667,7 @@ class AATBSApp(tk.Tk):
             self.chart_label.configure(image="", text="No evaluated samples.")
             return
 
-        preferred = ["bacterial", "fungal", "healthy", "pest", "viral"]
+        preferred = ["bacterial", "fungal", "healthy", "pest", "viral", "others", "non_leaf", "SKIP"]
         ordered = [c for c in preferred if c in labels]
         ordered.extend(c for c in labels if c not in ordered)
         labels = ordered
@@ -710,7 +711,7 @@ class AATBSApp(tk.Tk):
         ax_overall.text(
             0.5,
             -0.16,
-            f"{report.correct}/{report.evaluated} evaluated · {report.skipped} skipped",
+            f"{report.correct}/{report.evaluated} pipeline · {report.skipped} gate-SKIP",
             ha="center",
             va="top",
             fontsize=8,

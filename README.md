@@ -45,3 +45,7 @@ A tiny example file is in `sample_sd/log.csv`.
 
 - With “Normalize folders” enabled, PlantVillage folder names are mapped toward `bacterial / fungal / healthy / pest / viral` to match the ACLIS disease model.
 - Capture order must match SD `id` order (image 1 → id 1, and so on).
+- **Pipeline accuracy** counts every paired image, including gate `SKIP`s:
+  - folder `others` / `non_leaf` / `not_leaf`: correct if the gate predicts `others`
+  - folder `pest`: correct only if the gate predicts `pest` **and** the disease label is `pest`
+  - any other folder: a gate-`others` skip is a miss; otherwise the disease label must match the folder
