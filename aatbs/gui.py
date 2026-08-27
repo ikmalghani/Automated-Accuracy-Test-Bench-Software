@@ -22,7 +22,7 @@ from .analysis import (
     load_saved_run_analysis,
     write_report_csv,
 )
-from .dataset import discover_classes, sample_test_set
+from .dataset import clone_test_images, discover_classes, hold_out_split_dirs, sample_test_set
 from .metadata import (
     RunMetadata,
     chart_path,
@@ -143,6 +143,12 @@ class AATBSApp(tk.Tk):
         ttk.Label(form, text="Random seed (optional)").grid(row=2, column=0, sticky="w", pady=4)
         ttk.Entry(form, textvariable=self.seed_var, width=10).grid(row=2, column=1, sticky="w", pady=4)
 
+        ttk.Label(
+            form,
+            text="New test sets sample unique images from validation and test only (train is excluded).",
+            style="Sub.TLabel",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
         form.columnconfigure(1, weight=1)
 
         btns = ttk.Frame(left)
@@ -152,6 +158,14 @@ class AATBSApp(tk.Tk):
             side="left", padx=8
         )
         ttk.Button(btns, text="Load existing run folder…", command=self._load_run_dialog).pack(side="left")
+
+        clone_row = ttk.Frame(left)
+        clone_row.pack(fill="x", pady=(0, 8))
+        ttk.Button(
+            clone_row,
+            text="New run from previous test set…",
+            command=self._new_run_from_previous,
+        ).pack(side="left")
 
         ttk.Label(left, text="Detected classes (from folder names)", style="Sub.TLabel").pack(anchor="w", pady=(4, 2))
         self.class_list = tk.Listbox(left, height=14, font=("Segoe UI", 10), bg="white", fg=TEXT)
@@ -193,10 +207,16 @@ class AATBSApp(tk.Tk):
             return
 
         self.class_list.delete(0, "end")
+        splits = hold_out_split_dirs(Path(root))
+        split_note = "val+test" if splits else "class folders"
         for name, paths in sorted(classes.items()):
-            self.class_list.insert("end", f"{name}  ({len(paths)} images)")
+            self.class_list.insert("end", f"{name}  ({len(paths)} unique images in {split_note})")
         if announce:
-            messagebox.showinfo("Dataset", f"Found {len(classes)} classes.")
+            messagebox.showinfo(
+                "Dataset",
+                f"Found {len(classes)} classes in {split_note} "
+                "(train is not used for test-set sampling).",
+            )
 
     def _generate_test_set(self) -> None:
         root = self.dataset_var.get().strip()
@@ -228,8 +248,56 @@ class AATBSApp(tk.Tk):
         self.notebook.select(self.capture_tab)
         messagebox.showinfo(
             "Test set ready",
-            f"Generated {meta.total_images} images across {len(meta.classes)} classes.\n"
+            f"Generated {meta.total_images} unique images across {len(meta.classes)} classes "
+            f"({ipc} per class from validation/test).\n"
             f"Run folder: {run_dir.name} (run #{meta.run_number})",
+        )
+
+    def _new_run_from_previous(self) -> None:
+        initial = default_data_dir()
+        initial.mkdir(parents=True, exist_ok=True)
+        folder = filedialog.askdirectory(
+            title="Select a previous run folder to reuse its test set",
+            initialdir=str(initial),
+        )
+        if not folder:
+            return
+        try:
+            source_dir = resolve_run_dir(Path(folder))
+            source = load_run(source_dir)
+            if not source.images:
+                raise ValueError(
+                    f"{source_dir.name} has no test-set images in metadata.json."
+                )
+            images = clone_test_images(source.images)
+            meta, run_dir, path = create_and_save_run(
+                Path(source.dataset_root),
+                images,
+                images_per_class=source.images_per_class,
+                seed=source.seed,
+                notes=f"Reused test set from {source.folder_name or source_dir.name}",
+            )
+        except (OSError, ValueError, KeyError, FileNotFoundError) as exc:
+            messagebox.showerror("New run", str(exc))
+            return
+
+        self.dataset_var.set(source.dataset_root)
+        self.ipc_var.set(str(source.images_per_class))
+        self.seed_var.set("" if source.seed is None else str(source.seed))
+        if Path(source.dataset_root).is_dir():
+            self._scan_dataset(announce=False)
+        self._set_run(meta, run_dir, path)
+        self.notebook.select(self.capture_tab)
+        missing = sum(1 for img in images if not Path(img.path).is_file())
+        extra = ""
+        if missing:
+            extra = f"\nWarning: {missing} image file(s) from the original run are missing on disk."
+        messagebox.showinfo(
+            "Test set ready",
+            f"Created {run_dir.name} (run #{meta.run_number}) using the same "
+            f"{meta.total_images} test-set images as {source_dir.name}.\n"
+            "Capture flags were reset for the new run."
+            f"{extra}",
         )
 
     def _load_run_dialog(self) -> None:
@@ -280,8 +348,10 @@ class AATBSApp(tk.Tk):
             f"Seed:             {m.seed}",
             f"Total images:     {m.total_images}",
             f"Captured so far:  {m.captured_count()} / {m.total_images}",
-            f"Classes ({len(m.classes)}):",
         ]
+        if m.notes:
+            lines.append(f"Notes:            {m.notes}")
+        lines.append(f"Classes ({len(m.classes)}):")
         for c in m.classes:
             count = sum(1 for img in m.images if img.class_name == c)
             lines.append(f"  - {c}: {count}")
