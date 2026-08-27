@@ -24,7 +24,10 @@ RUN_FOLDER_RE = re.compile(r"^run(\d+)_(\d{8})$")
 METADATA_NAME = "metadata.json"
 LOG_NAME = "log.csv"
 RESULTS_NAME = "analysis_results.csv"
-CHART_NAME = "chart.png"
+CHART_NAME = "chart.png"  # legacy alias for the pipeline chart
+CHART_PIPELINE_NAME = "chart_pipeline.png"
+CHART_GATE_NAME = "chart_gate.png"
+CHART_CLASSIFIER_NAME = "chart_classifier.png"
 
 # Older runs may still use this name.
 LEGACY_RESULTS_NAMES = ("results.csv",)
@@ -174,7 +177,18 @@ def find_results_csv(run_dir: Path) -> Path | None:
 
 
 def chart_path(run_dir: Path) -> Path:
+    """Legacy pipeline chart path (`chart.png`)."""
     return Path(run_dir) / CHART_NAME
+
+
+def chart_paths(run_dir: Path) -> dict:
+    """Separate chart files for gate, classifier, and pipeline analyses."""
+    run_dir = Path(run_dir)
+    return {
+        "gate": run_dir / CHART_GATE_NAME,
+        "classifier": run_dir / CHART_CLASSIFIER_NAME,
+        "pipeline": run_dir / CHART_PIPELINE_NAME,
+    }
 
 
 def new_run_id(run_number: int) -> str:

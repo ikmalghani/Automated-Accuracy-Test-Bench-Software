@@ -7,18 +7,18 @@ import shutil
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .metadata import LEGACY_RESULTS_NAMES, RESULTS_NAME, RunMetadata
 
 
 # Matches capture_sd_log.cpp header on the STM32 firmware.
+# Better Gate (current): pct_not_leaf. Leaf+Pest logs: pct_others, pct_pest.
 SD_CSV_FIELDS = [
     "id",
     "gate_pred",
     "pct_leaf",
-    "pct_others",
-    "pct_pest",
+    "pct_not_leaf",
     "disease_pred",
     "gate_ms",
     "infer_ms",
@@ -46,6 +46,30 @@ _GATE_OTHERS = {
     "noleaf",
 }
 _DISEASE_SKIP_LABELS = {"", "SKIP", "NONE", "N/A", "-"}
+
+# Canonical spellings used when a log mixes aliases.
+_GATE_REJECT_CANON = {
+    "others": "others",
+    "other": "others",
+    "not_leaf": "not_leaf",
+    "non_leaf": "not_leaf",
+    "nonleaf": "not_leaf",
+    "noleaf": "not_leaf",
+}
+
+GATE_CLASS_ORDER = ("leaf", "not_leaf", "others", "pest")
+CLASSIFIER_CLASS_ORDER = ("bacterial", "fungal", "healthy", "pest", "viral")
+PIPELINE_CLASS_ORDER = (
+    "bacterial",
+    "fungal",
+    "healthy",
+    "pest",
+    "viral",
+    "others",
+    "non_leaf",
+    "not_leaf",
+    "SKIP",
+)
 
 
 def _norm_label(value: str) -> str:
@@ -78,14 +102,81 @@ def is_gate_pest(gate_pred: str) -> bool:
     return _norm_label(gate_pred) == "pest"
 
 
+def canonical_gate_pred(gate_pred: str) -> str:
+    """Normalize a gate prediction (others/not_leaf aliases collapsed)."""
+    n = _norm_label(gate_pred)
+    if n in _GATE_REJECT_CANON:
+        return _GATE_REJECT_CANON[n]
+    return n
+
+
+def infer_gate_classes(
+    gate_preds: Iterable[str],
+    *,
+    pest_signal: bool = False,
+) -> List[str]:
+    """
+    Infer the gate model's class set (not just labels that happened to appear).
+
+    - 3-class Leaf+Pest: leaf / others / pest
+    - 2-class Better Gate: leaf / not_leaf  (logs may say others instead of not_leaf)
+    """
+    observed = {canonical_gate_pred(p) for p in gate_preds}
+    observed.discard("")
+    has_pest = pest_signal or "pest" in observed
+    has_not_leaf = bool(observed & {"not_leaf"})
+    has_others = bool(observed & {"others"})
+
+    if has_pest:
+        return ["leaf", "others", "pest"]
+    if has_not_leaf:
+        return ["leaf", "not_leaf"]
+    if has_others:
+        return ["leaf", "others"]
+    extra = sorted(observed - {"leaf"})
+    if extra:
+        classes = (["leaf"] if "leaf" in observed else []) + extra
+        return classes
+    return ["leaf", "not_leaf"]
+
+
+def gate_reject_label(gate_classes: List[str]) -> str:
+    for name in gate_classes:
+        if canonical_gate_pred(name) in {"others", "not_leaf"}:
+            return name
+    return "not_leaf"
+
+
+def expected_gate_label(ground_truth: str, gate_classes: List[str]) -> str:
+    """Map a dataset folder name onto the gate's label space."""
+    reject = gate_reject_label(gate_classes)
+    has_pest = any(_norm_label(c) == "pest" for c in gate_classes)
+    if is_reject_class(ground_truth):
+        return reject
+    if has_pest and is_pest_class(ground_truth):
+        return "pest"
+    return "leaf"
+
+
+def align_gate_pred(gate_pred: str, gate_classes: List[str]) -> str:
+    """Map a raw gate_pred onto the schema's class names."""
+    canon = canonical_gate_pred(gate_pred)
+    if canon in {"others", "not_leaf"}:
+        return gate_reject_label(gate_classes)
+    return canon or "?"
+
+
 def score_pipeline(ground_truth: str, gate_pred: str, disease_pred: str) -> Tuple[bool, bool]:
     """
     Whole-pipeline correctness (gate + disease), not disease-only.
 
-    - others / non_leaf folders: correct iff the gate predicts others (reject).
-    - pest folder: correct iff the gate predicts pest and the disease label is pest.
-    - any other folder (leaf disease classes): a gate-others SKIP is a miss;
+    Better Gate (leaf / not_leaf):
+    - others / non_leaf / not_leaf folders: correct iff the gate rejects.
+    - disease folders including pest: a gate reject/SKIP is a miss;
       otherwise the disease prediction must match the folder.
+
+    Legacy Leaf+Pest logs that still emit gate_pred=pest continue to work:
+    pest is then treated as a disease class (gate did not reject).
     """
     skipped = is_disease_skip(disease_pred)
     gt = _norm_label(ground_truth)
@@ -93,10 +184,6 @@ def score_pipeline(ground_truth: str, gate_pred: str, disease_pred: str) -> Tupl
 
     if is_reject_class(gt):
         return is_gate_others(gate_pred), skipped
-
-    if is_pest_class(gt):
-        correct = is_gate_pest(gate_pred) and (not skipped) and disease == "pest"
-        return correct, skipped
 
     if skipped or is_gate_others(gate_pred):
         return False, skipped
@@ -113,14 +200,14 @@ def pipeline_pred_label(
         if skipped:
             return "SKIP"
         return str(disease_pred or "").strip().lower() or _norm_label(gate_pred) or "?"
-    if is_pest_class(ground_truth) and not is_gate_pest(gate_pred):
-        if skipped or is_gate_others(gate_pred):
-            return "SKIP"
-        return _norm_label(gate_pred) or "SKIP"
     if skipped or is_gate_others(gate_pred):
         return "SKIP"
     return str(disease_pred or "").strip().lower() or "?"
 
+
+def score_classifier(ground_truth: str, disease_pred: str) -> bool:
+    """CNN-only: disease prediction vs folder name (caller must drop SKIP)."""
+    return _norm_label(disease_pred) == _norm_label(ground_truth)
 
 
 @dataclass
@@ -150,6 +237,44 @@ class PairResult:
 
 
 @dataclass
+class ModelMetrics:
+    """Accuracy / confusion for one analysis view (gate, classifier, or pipeline)."""
+
+    name: str
+    overall_accuracy: float = 0.0
+    evaluated: int = 0
+    correct: int = 0
+    skipped: int = 0
+    per_class: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    confusion: Dict[str, Counter] = field(default_factory=dict)
+    notes: List[str] = field(default_factory=list)
+
+    def summary_lines(self) -> List[str]:
+        lines = [
+            f"{self.name}",
+            f"Evaluated: {self.evaluated}",
+            f"Correct: {self.correct}",
+        ]
+        if self.skipped:
+            lines.append(f"Skipped: {self.skipped}")
+        lines.append(f"Overall accuracy: {self.overall_accuracy * 100:.2f}%")
+        if self.notes:
+            lines.append("")
+            lines.extend(self.notes)
+        lines.append("")
+        lines.append("Per-class accuracy:")
+        if self.per_class:
+            for cls, stats in sorted(self.per_class.items()):
+                lines.append(
+                    f"  {cls}: {stats['accuracy'] * 100:.2f}% "
+                    f"({int(stats['correct'])}/{int(stats['total'])})"
+                )
+        else:
+            lines.append("  (none)")
+        return lines
+
+
+@dataclass
 class AnalysisReport:
     paired: List[PairResult] = field(default_factory=list)
     unmatched_meta: int = 0
@@ -163,30 +288,39 @@ class AnalysisReport:
     gate_counts: Counter = field(default_factory=Counter)
     mean_infer_ms: float = 0.0
     mean_gate_ms: float = 0.0
+    gate_classes: List[str] = field(default_factory=list)
+    gate_class_count: int = 0
+    pipeline: ModelMetrics = field(default_factory=lambda: ModelMetrics("Overall pipeline"))
+    gate: ModelMetrics = field(default_factory=lambda: ModelMetrics("Gate model"))
+    classifier: ModelMetrics = field(
+        default_factory=lambda: ModelMetrics("Plant disease classifier")
+    )
 
     def summary_lines(self) -> List[str]:
+        classes = ", ".join(self.gate_classes) if self.gate_classes else "?"
         lines = [
             f"Paired samples: {len(self.paired)}",
-            f"Evaluated (full pipeline): {self.evaluated}",
-            f"Correct: {self.correct}",
-            f"Gate skipped disease CNN: {self.skipped}",
-            f"Overall pipeline accuracy: {self.overall_accuracy * 100:.2f}%",
+            f"Gate classes ({self.gate_class_count}): {classes}",
             f"Mean gate time: {self.mean_gate_ms:.1f} ms",
             f"Mean infer time: {self.mean_infer_ms:.1f} ms",
             f"Unmatched metadata rows: {self.unmatched_meta}",
             f"Unmatched prediction rows: {self.unmatched_preds}",
             "",
-            "Per-class accuracy:",
+            (
+                f"Pipeline accuracy: {self.pipeline.overall_accuracy * 100:.2f}% "
+                f"({self.pipeline.correct}/{self.pipeline.evaluated}; "
+                f"{self.pipeline.skipped} gate-SKIP)"
+            ),
+            (
+                f"Gate accuracy: {self.gate.overall_accuracy * 100:.2f}% "
+                f"({self.gate.correct}/{self.gate.evaluated})"
+            ),
+            (
+                f"Classifier accuracy (SKIP excluded): "
+                f"{self.classifier.overall_accuracy * 100:.2f}% "
+                f"({self.classifier.correct}/{self.classifier.evaluated})"
+            ),
         ]
-        for cls, stats in sorted(self.per_class.items()):
-            lines.append(
-                f"  {cls}: {stats['accuracy'] * 100:.2f}% "
-                f"({int(stats['correct'])}/{int(stats['total'])})"
-            )
-        lines.append("")
-        lines.append("Gate predictions:")
-        for name, count in self.gate_counts.most_common():
-            lines.append(f"  {name}: {count}")
         return lines
 
 
@@ -285,12 +419,79 @@ def load_results_csv(path: Path) -> List[PairResult]:
     return pairs
 
 
-def report_from_pairs(paired: List[PairResult]) -> AnalysisReport:
-    """Rebuild an AnalysisReport from PairResult rows (e.g. results.csv)."""
-    report = AnalysisReport(paired=list(paired))
-    per_class_correct: Dict[str, int] = defaultdict(int)
-    per_class_total: Dict[str, int] = defaultdict(int)
-    confusion: Dict[str, Counter] = defaultdict(Counter)
+def _finalize_per_class(
+    correct_map: Dict[str, int], total_map: Dict[str, int]
+) -> Dict[str, Dict[str, float]]:
+    return {
+        cls: {
+            "correct": float(correct_map[cls]),
+            "total": float(total_map[cls]),
+            "accuracy": (
+                correct_map[cls] / total_map[cls] if total_map[cls] else 0.0
+            ),
+        }
+        for cls in sorted(total_map.keys())
+    }
+
+
+def _finish_metrics(
+    metrics: ModelMetrics,
+    correct_map: Dict[str, int],
+    total_map: Dict[str, int],
+    confusion: Dict[str, Counter],
+) -> None:
+    metrics.overall_accuracy = (
+        metrics.correct / metrics.evaluated if metrics.evaluated else 0.0
+    )
+    metrics.per_class = _finalize_per_class(correct_map, total_map)
+    metrics.confusion = dict(confusion)
+
+
+def score_pairs(
+    paired: List[PairResult],
+    gate_classes: Optional[List[str]] = None,
+    *,
+    unmatched_meta: int = 0,
+    unmatched_preds: int = 0,
+    pest_signal: bool = False,
+) -> AnalysisReport:
+    """Fill pipeline, gate, and classifier metrics from paired rows."""
+    if gate_classes is None:
+        gate_classes = infer_gate_classes(
+            (row.gate_pred for row in paired), pest_signal=pest_signal
+        )
+
+    report = AnalysisReport(
+        paired=list(paired),
+        unmatched_meta=unmatched_meta,
+        unmatched_preds=unmatched_preds,
+        gate_classes=list(gate_classes),
+        gate_class_count=len(gate_classes),
+    )
+    report.pipeline = ModelMetrics("Overall pipeline")
+    report.gate = ModelMetrics("Gate model")
+    report.classifier = ModelMetrics("Plant disease classifier")
+    report.gate.notes = [
+        f"Gate classes ({report.gate_class_count}): {', '.join(report.gate_classes)}",
+        "Gate prediction vs folder ground truth mapped into gate label space.",
+    ]
+    report.classifier.notes = [
+        "SKIP results ignored; CNN prediction vs folder ground truth only.",
+    ]
+    report.pipeline.notes = [
+        "Whole cascade: gate reject on a leaf/pest image is a miss; "
+        "others/not_leaf folders are correct iff the gate rejects.",
+    ]
+
+    pipe_correct: Dict[str, int] = defaultdict(int)
+    pipe_total: Dict[str, int] = defaultdict(int)
+    pipe_conf: Dict[str, Counter] = defaultdict(Counter)
+    gate_correct_map: Dict[str, int] = defaultdict(int)
+    gate_total: Dict[str, int] = defaultdict(int)
+    gate_conf: Dict[str, Counter] = defaultdict(Counter)
+    clf_correct_map: Dict[str, int] = defaultdict(int)
+    clf_total: Dict[str, int] = defaultdict(int)
+    clf_conf: Dict[str, Counter] = defaultdict(Counter)
     infer_times: List[int] = []
     gate_times: List[int] = []
 
@@ -302,42 +503,65 @@ def report_from_pairs(paired: List[PairResult]) -> AnalysisReport:
         row.skipped = skipped
         report.gate_counts[row.gate_pred or "?"] += 1
         gate_times.append(row.gate_ms)
+
         gt = row.ground_truth.lower()
         pred_label = pipeline_pred_label(
             row.ground_truth, row.gate_pred, row.disease_pred, skipped
         )
-        per_class_total[gt] += 1
-        confusion[gt][pred_label] += 1
-        report.evaluated += 1
+        pipe_total[gt] += 1
+        pipe_conf[gt][pred_label] += 1
+        report.pipeline.evaluated += 1
         if skipped:
-            report.skipped += 1
+            report.pipeline.skipped += 1
         else:
             infer_times.append(row.infer_ms)
         if correct:
-            per_class_correct[gt] += 1
-            report.correct += 1
+            pipe_correct[gt] += 1
+            report.pipeline.correct += 1
 
-    report.overall_accuracy = (
-        report.correct / report.evaluated if report.evaluated else 0.0
+        expected_gate = expected_gate_label(row.ground_truth, report.gate_classes)
+        predicted_gate = align_gate_pred(row.gate_pred, report.gate_classes)
+        gate_total[expected_gate] += 1
+        gate_conf[expected_gate][predicted_gate] += 1
+        report.gate.evaluated += 1
+        if predicted_gate == expected_gate:
+            gate_correct_map[expected_gate] += 1
+            report.gate.correct += 1
+
+        if not skipped:
+            disease = str(row.disease_pred or "").strip().lower()
+            clf_total[gt] += 1
+            clf_conf[gt][disease] += 1
+            report.classifier.evaluated += 1
+            if score_classifier(row.ground_truth, row.disease_pred):
+                clf_correct_map[gt] += 1
+                report.classifier.correct += 1
+
+    _finish_metrics(report.pipeline, pipe_correct, pipe_total, pipe_conf)
+    _finish_metrics(report.gate, gate_correct_map, gate_total, gate_conf)
+    _finish_metrics(report.classifier, clf_correct_map, clf_total, clf_conf)
+    report.classifier.notes.append(
+        f"Excluded SKIP rows: {report.pipeline.skipped}"
     )
+
     report.mean_infer_ms = (
         sum(infer_times) / len(infer_times) if infer_times else 0.0
     )
     report.mean_gate_ms = sum(gate_times) / len(gate_times) if gate_times else 0.0
-    report.confusion = dict(confusion)
-    report.per_class = {
-        cls: {
-            "correct": float(per_class_correct[cls]),
-            "total": float(per_class_total[cls]),
-            "accuracy": (
-                per_class_correct[cls] / per_class_total[cls]
-                if per_class_total[cls]
-                else 0.0
-            ),
-        }
-        for cls in sorted(per_class_total.keys())
-    }
+
+    # Backward-compatible aliases: overall / per-class / confusion = pipeline.
+    report.overall_accuracy = report.pipeline.overall_accuracy
+    report.evaluated = report.pipeline.evaluated
+    report.correct = report.pipeline.correct
+    report.skipped = report.pipeline.skipped
+    report.per_class = report.pipeline.per_class
+    report.confusion = report.pipeline.confusion
     return report
+
+
+def report_from_pairs(paired: List[PairResult]) -> AnalysisReport:
+    """Rebuild an AnalysisReport from PairResult rows (e.g. results.csv)."""
+    return score_pairs(list(paired))
 
 
 def load_saved_run_analysis(run_dir: Path) -> Tuple[AnalysisReport, Path, str]:
@@ -402,7 +626,13 @@ def load_inference_csv(path: Path) -> List[InferenceRow]:
                         id=int(id_raw),
                         gate_pred=str(raw.get("gate_pred", "")).strip(),
                         pct_leaf=int(float(raw.get("pct_leaf") or 0)),
-                        pct_others=int(float(raw.get("pct_others") or 0)),
+                        pct_others=int(
+                            float(
+                                raw.get("pct_not_leaf")
+                                or raw.get("pct_others")
+                                or 0
+                            )
+                        ),
                         pct_pest=int(float(raw.get("pct_pest") or 0)),
                         disease_pred=str(raw.get("disease_pred", "")).strip(),
                         gate_ms=int(float(raw.get("gate_ms") or 0)),
@@ -423,80 +653,51 @@ def analyze(meta: RunMetadata, predictions: List[InferenceRow]) -> AnalysisRepor
     Capture order on the bench is 1..N; the STM32 logger writes id=1,2,...
     so index == id is the default alignment.
 
-    Accuracy is whole-pipeline (gate + disease): a gate-others SKIP on a
-    leaf/pest image, or a non-pest gate on a pest image, counts as wrong.
+    Builds three views:
+      - gate: gate_pred vs folder truth in gate label space
+      - classifier: disease_pred vs folder truth, SKIP rows dropped
+      - pipeline: whole cascade (gate + disease), including SKIP as misses
+        except on reject folders
     """
     by_id = {row.id: row for row in predictions}
-    report = AnalysisReport()
-
-    per_class_correct: Dict[str, int] = defaultdict(int)
-    per_class_total: Dict[str, int] = defaultdict(int)
-    confusion: Dict[str, Counter] = defaultdict(Counter)
-    infer_times: List[int] = []
-    gate_times: List[int] = []
-
+    pairs: List[PairResult] = []
+    unmatched_meta = 0
     used_ids = set()
+
     for img in meta.images:
         pred = by_id.get(img.index)
         if pred is None:
-            report.unmatched_meta += 1
+            unmatched_meta += 1
             continue
         used_ids.add(pred.id)
-
-        disease = pred.disease_pred.strip()
-        gt = img.class_name.lower()
-        correct, skipped = score_pipeline(img.class_name, pred.gate_pred, disease)
-        pred_label = pipeline_pred_label(
-            img.class_name, pred.gate_pred, disease, skipped
+        pairs.append(
+            PairResult(
+                index=img.index,
+                ground_truth=img.class_name,
+                filename=img.filename,
+                disease_pred=pred.disease_pred.strip(),
+                gate_pred=pred.gate_pred,
+                correct=False,
+                skipped=False,
+                infer_ms=pred.infer_ms,
+                gate_ms=pred.gate_ms,
+            )
         )
 
-        pair = PairResult(
-            index=img.index,
-            ground_truth=img.class_name,
-            filename=img.filename,
-            disease_pred=disease,
-            gate_pred=pred.gate_pred,
-            correct=correct,
-            skipped=skipped,
-            infer_ms=pred.infer_ms,
-            gate_ms=pred.gate_ms,
-        )
-        report.paired.append(pair)
-        report.gate_counts[pred.gate_pred or "?"] += 1
-        gate_times.append(pred.gate_ms)
-        per_class_total[gt] += 1
-        confusion[gt][pred_label] += 1
-        report.evaluated += 1
-        if skipped:
-            report.skipped += 1
-        else:
-            infer_times.append(pred.infer_ms)
-        if correct:
-            per_class_correct[gt] += 1
-            report.correct += 1
-
-    report.unmatched_preds = sum(1 for row in predictions if row.id not in used_ids)
-    report.overall_accuracy = (
-        report.correct / report.evaluated if report.evaluated else 0.0
+    unmatched_preds = sum(1 for row in predictions if row.id not in used_ids)
+    pest_signal = any(
+        row.pct_pest > 0 or is_gate_pest(row.gate_pred) for row in predictions
     )
-    report.mean_infer_ms = (
-        sum(infer_times) / len(infer_times) if infer_times else 0.0
+    gate_classes = infer_gate_classes(
+        (row.gate_pred for row in predictions), pest_signal=pest_signal
     )
-    report.mean_gate_ms = sum(gate_times) / len(gate_times) if gate_times else 0.0
-    report.confusion = dict(confusion)
-    report.per_class = {
-        cls: {
-            "correct": float(per_class_correct[cls]),
-            "total": float(per_class_total[cls]),
-            "accuracy": (
-                per_class_correct[cls] / per_class_total[cls]
-                if per_class_total[cls]
-                else 0.0
-            ),
-        }
-        for cls in sorted(per_class_total.keys())
-    }
-    return report
+    return score_pairs(
+        pairs,
+        gate_classes,
+        unmatched_meta=unmatched_meta,
+        unmatched_preds=unmatched_preds,
+        pest_signal=pest_signal,
+    )
 
 
 def write_report_csv(report: AnalysisReport, path: Path) -> Path:
@@ -560,15 +761,32 @@ def archive_log_to_run(source_csv: Path, run_dir: Path) -> Path:
     return dest
 
 
-def confusion_matrix_labels(report: AnalysisReport) -> Tuple[List[str], List[List[int]]]:
-    labels = sorted(
-        {
-            *report.confusion.keys(),
-            *(pred for counter in report.confusion.values() for pred in counter),
-        }
-    )
+def confusion_matrix_from(
+    confusion: Dict[str, Counter],
+    preferred: Iterable[str] | None = None,
+    *,
+    always_include_preferred: bool = False,
+) -> Tuple[List[str], List[List[int]]]:
+    labels = {
+        *confusion.keys(),
+        *(pred for counter in confusion.values() for pred in counter),
+    }
+    if preferred:
+        if always_include_preferred:
+            ordered = list(preferred)
+        else:
+            ordered = [c for c in preferred if c in labels]
+        ordered.extend(c for c in sorted(labels) if c not in ordered)
+        labels_list = ordered
+    else:
+        labels_list = sorted(labels)
     matrix = [
-        [int(report.confusion.get(gt, Counter()).get(pred, 0)) for pred in labels]
-        for gt in labels
+        [int(confusion.get(gt, Counter()).get(pred, 0)) for pred in labels_list]
+        for gt in labels_list
     ]
-    return labels, matrix
+    return labels_list, matrix
+
+
+def confusion_matrix_labels(report: AnalysisReport) -> Tuple[List[str], List[List[int]]]:
+    """Pipeline confusion matrix (rows=truth, cols=pred)."""
+    return confusion_matrix_from(report.confusion, PIPELINE_CLASS_ORDER)

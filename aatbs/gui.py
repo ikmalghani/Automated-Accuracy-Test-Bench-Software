@@ -10,9 +10,13 @@ from typing import Optional
 from PIL import Image, ImageTk
 
 from .analysis import (
+    CLASSIFIER_CLASS_ORDER,
+    GATE_CLASS_ORDER,
+    PIPELINE_CLASS_ORDER,
+    ModelMetrics,
     analyze,
     archive_log_to_run,
-    confusion_matrix_labels,
+    confusion_matrix_from,
     find_sd_csv,
     load_inference_csv,
     load_saved_run_analysis,
@@ -22,6 +26,7 @@ from .dataset import discover_classes, sample_test_set
 from .metadata import (
     RunMetadata,
     chart_path,
+    chart_paths,
     create_and_save_run,
     default_data_dir,
     load_run,
@@ -52,10 +57,11 @@ class AATBSApp(tk.Tk):
         self.run_path: Optional[Path] = None  # metadata.json inside run_dir
         self.current_pos = 0  # 0-based into run.images
         self._photo: Optional[ImageTk.PhotoImage] = None
-        self._chart_photo: Optional[ImageTk.PhotoImage] = None
+        self._chart_photos: dict = {}
         self._last_report_run_dir: Optional[Path] = None
-        self._chart_source_path: Optional[Path] = None
-        self._chart_resize_job: Optional[str] = None
+        self._chart_source_paths: dict = {}
+        self._chart_resize_jobs: dict = {}
+        self._analysis_panels: dict = {}
 
         self._style()
         self._build()
@@ -93,7 +99,7 @@ class AATBSApp(tk.Tk):
         ttk.Label(header, text="AATBS", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="Class-folder dataset → on-screen capture → SD inference import → accuracy analysis",
+            text="Class-folder dataset → on-screen capture → SD inference import → gate / classifier / pipeline analysis",
             style="Sub.TLabel",
         ).pack(anchor="w")
 
@@ -423,34 +429,69 @@ class AATBSApp(tk.Tk):
             command=self._load_old_analysis,
         ).pack(side="left", padx=8)
 
-        # Charts take most of the vertical space.
-        chart_wrap = ttk.Frame(self.analysis_tab)
-        chart_wrap.pack(fill="both", expand=True, pady=(6, 4))
-        ttk.Label(chart_wrap, text="Accuracy charts", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        self.chart_label = tk.Label(chart_wrap, bg="#ffffff", text="Charts appear after analysis", anchor="center")
-        self.chart_label.pack(fill="both", expand=True)
-        self.chart_label.bind("<Configure>", self._on_chart_resize)
+        self.analysis_views = ttk.Notebook(self.analysis_tab)
+        self.analysis_views.pack(fill="both", expand=True, pady=(6, 4))
+
+        placeholder = (
+            "Import the SD card .csv after the capture session,\n"
+            "or load an old analysis by browsing a data/runN_YYYYMMDD folder."
+        )
+        panel_specs = (
+            (
+                "gate",
+                "Gate model",
+                "Gate charts appear after analysis",
+                placeholder,
+            ),
+            (
+                "classifier",
+                "Plant disease classifier",
+                "Classifier charts appear after analysis",
+                placeholder,
+            ),
+            (
+                "pipeline",
+                "Overall pipeline",
+                "Pipeline charts appear after analysis",
+                placeholder,
+            ),
+        )
+        for kind, title, chart_placeholder, summary_placeholder in panel_specs:
+            frame = ttk.Frame(self.analysis_views, padding=4)
+            self.analysis_views.add(frame, text=title)
+            chart_label = tk.Label(
+                frame, bg="#ffffff", text=chart_placeholder, anchor="center"
+            )
+            chart_label.pack(fill="both", expand=True)
+            chart_label.bind(
+                "<Configure>", lambda event, k=kind: self._on_chart_resize(k)
+            )
+            ttk.Label(frame, text="Summary", font=("Segoe UI", 10, "bold")).pack(
+                anchor="w", pady=(6, 0)
+            )
+            summary_text = tk.Text(
+                frame, wrap="word", font=("Consolas", 9), height=8, bg="white", fg=TEXT
+            )
+            summary_text.pack(fill="x")
+            summary_text.insert("1.0", summary_placeholder)
+            summary_text.configure(state="disabled")
+            self._analysis_panels[kind] = {
+                "frame": frame,
+                "chart_label": chart_label,
+                "summary_text": summary_text,
+            }
+
+        # Keep a handle for older code paths that still mention summary_text.
+        self.summary_text = self._analysis_panels["pipeline"]["summary_text"]
+        self.chart_label = self._analysis_panels["pipeline"]["chart_label"]
 
         bottom = ttk.Frame(self.analysis_tab)
         bottom.pack(fill="x", pady=(0, 4))
 
-        left = ttk.Frame(bottom)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
-        right = ttk.Frame(bottom)
-        right.pack(side="right", fill="both", expand=True)
-
-        ttk.Label(left, text="Summary", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        self.summary_text = tk.Text(left, wrap="word", font=("Consolas", 9), height=8, bg="white", fg=TEXT)
-        self.summary_text.pack(fill="both", expand=True)
-        self.summary_text.insert(
-            "1.0",
-            "Import the SD card .csv after the capture session,\n"
-            "or load an old analysis by browsing a data/runN_YYYYMMDD folder.",
+        ttk.Label(bottom, text="Per-image results", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w"
         )
-        self.summary_text.configure(state="disabled")
-
-        ttk.Label(right, text="Per-image results", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        tree_frame = ttk.Frame(right)
+        tree_frame = ttk.Frame(bottom)
         tree_frame.pack(fill="both", expand=True)
         cols = ("index", "truth", "gate", "pred", "ok", "ms")
         self.result_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=8)
@@ -471,16 +512,18 @@ class AATBSApp(tk.Tk):
         scroll.pack(side="right", fill="y")
         self.result_tree.configure(yscrollcommand=scroll.set)
 
-    def _on_chart_resize(self, _event=None) -> None:
-        if not self._chart_source_path or not self._chart_source_path.is_file():
+    def _on_chart_resize(self, kind: str) -> None:
+        path = self._chart_source_paths.get(kind)
+        if not path or not Path(path).is_file():
             return
-        if self._chart_resize_job is not None:
+        job = self._chart_resize_jobs.get(kind)
+        if job is not None:
             try:
-                self.after_cancel(self._chart_resize_job)
+                self.after_cancel(job)
             except tk.TclError:
                 pass
-        self._chart_resize_job = self.after(
-            80, lambda: self._fit_chart_to_panel(self._chart_source_path)
+        self._chart_resize_jobs[kind] = self.after(
+            80, lambda k=kind: self._fit_chart_to_panel(k)
         )
 
     def _browse_analysis_run(self) -> None:
@@ -505,6 +548,29 @@ class AATBSApp(tk.Tk):
         if folder:
             self.sd_var.set(folder)
 
+    def _confusion_text(
+        self, metrics: ModelMetrics, preferred, *, always_include_preferred: bool = False
+    ) -> list:
+        labels, matrix = confusion_matrix_from(
+            metrics.confusion,
+            preferred,
+            always_include_preferred=always_include_preferred,
+        )
+        if not labels:
+            return []
+        lines = ["", "Confusion (rows=truth, cols=pred):"]
+        lines.append("        " + " ".join(f"{l[:8]:>8}" for l in labels))
+        for gt, row in zip(labels, matrix):
+            lines.append(f"{gt[:8]:>8} " + " ".join(f"{v:8d}" for v in row))
+        return lines
+
+    def _write_panel_summary(self, kind: str, lines: list) -> None:
+        widget = self._analysis_panels[kind]["summary_text"]
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", "\n".join(lines))
+        widget.configure(state="disabled")
+
     def _display_report(
         self,
         report,
@@ -518,30 +584,36 @@ class AATBSApp(tk.Tk):
         if rewrite_results:
             detail_path = write_report_csv(report, detail_path)
 
-        self.summary_text.configure(state="normal")
-        self.summary_text.delete("1.0", "end")
-        lines = [
+        header = [
             f"Run folder: {run_dir.name}",
             f"Run number: {meta.run_number or '?'}",
-            "",
-            f"OVERALL ACCURACY: {report.overall_accuracy * 100:.2f}%  "
-            f"({report.correct}/{report.evaluated} pipeline; "
-            f"{report.skipped} gate-SKIP)",
+            f"Source CSV (SD inference): {csv_path}",
+            f"analysis_results.csv (paired table): {detail_path}",
             "",
         ]
-        lines.extend(report.summary_lines())
-        lines.append("")
-        lines.append(f"Source CSV (SD inference): {csv_path}")
-        lines.append(f"analysis_results.csv (paired table): {detail_path}")
-        labels, matrix = confusion_matrix_labels(report)
-        if labels:
-            lines.append("")
-            lines.append("Confusion (rows=truth, cols=pred):")
-            lines.append("        " + " ".join(f"{l[:8]:>8}" for l in labels))
-            for gt, row in zip(labels, matrix):
-                lines.append(f"{gt[:8]:>8} " + " ".join(f"{v:8d}" for v in row))
-        self.summary_text.insert("1.0", "\n".join(lines))
-        self.summary_text.configure(state="disabled")
+        overview = report.summary_lines()
+
+        gate_lines = header + overview + [""] + report.gate.summary_lines()
+        gate_lines.extend(
+            self._confusion_text(
+                report.gate,
+                report.gate_classes or GATE_CLASS_ORDER,
+                always_include_preferred=True,
+            )
+        )
+        self._write_panel_summary("gate", gate_lines)
+
+        clf_lines = header + overview + [""] + report.classifier.summary_lines()
+        clf_lines.extend(self._confusion_text(report.classifier, CLASSIFIER_CLASS_ORDER))
+        self._write_panel_summary("classifier", clf_lines)
+
+        pipe_lines = header + overview + [""] + report.pipeline.summary_lines()
+        pipe_lines.append("")
+        pipe_lines.append("Gate predictions:")
+        for name, count in report.gate_counts.most_common():
+            pipe_lines.append(f"  {name}: {count}")
+        pipe_lines.extend(self._confusion_text(report.pipeline, PIPELINE_CLASS_ORDER))
+        self._write_panel_summary("pipeline", pipe_lines)
 
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
@@ -560,7 +632,7 @@ class AATBSApp(tk.Tk):
             )
 
         self._last_report_run_dir = run_dir
-        self._render_chart(report, run_dir)
+        self._render_all_charts(report, run_dir)
 
     def _run_analysis(self) -> None:
         run_raw = self.analysis_run_var.get().strip()
@@ -583,12 +655,20 @@ class AATBSApp(tk.Tk):
         self.analysis_run_var.set(str(run_dir))
         self.sd_var.set(str(archived))
         self._display_report(report, meta, run_dir, archived)
+        classes = ", ".join(report.gate_classes) or "?"
         messagebox.showinfo(
             "Analysis complete",
-            f"Overall accuracy: {report.overall_accuracy * 100:.2f}% "
-            f"({report.correct}/{report.evaluated})\n"
+            f"Gate ({report.gate_class_count}-class: {classes}): "
+            f"{report.gate.overall_accuracy * 100:.2f}% "
+            f"({report.gate.correct}/{report.gate.evaluated})\n"
+            f"Classifier (SKIP excluded): "
+            f"{report.classifier.overall_accuracy * 100:.2f}% "
+            f"({report.classifier.correct}/{report.classifier.evaluated})\n"
+            f"Pipeline: {report.pipeline.overall_accuracy * 100:.2f}% "
+            f"({report.pipeline.correct}/{report.pipeline.evaluated})\n"
             f"{archived.name} copied into {run_dir.name}\n"
-            f"Saved analysis_results.csv + chart.png",
+            f"Saved analysis_results.csv + chart_gate.png, "
+            f"chart_classifier.png, chart_pipeline.png",
         )
 
     def _load_old_analysis(self) -> None:
@@ -625,32 +705,109 @@ class AATBSApp(tk.Tk):
             if kind == "sd_csv"
             else f"Loaded from {csv_file.name}"
         )
+        classes = ", ".join(report.gate_classes) or "?"
         messagebox.showinfo(
             "Loaded analysis",
             f"Loaded {run_dir.name}\n"
             f"{source_note}\n"
-            f"Accuracy: {report.overall_accuracy * 100:.2f}% "
-            f"({report.correct}/{report.evaluated})",
+            f"Gate ({report.gate_class_count}-class: {classes}): "
+            f"{report.gate.overall_accuracy * 100:.2f}%\n"
+            f"Classifier (SKIP excluded): "
+            f"{report.classifier.overall_accuracy * 100:.2f}%\n"
+            f"Pipeline: {report.pipeline.overall_accuracy * 100:.2f}%",
         )
 
-
-    def _fit_chart_to_panel(self, path: Path) -> None:
+    def _fit_chart_to_panel(self, kind: str) -> None:
+        path = self._chart_source_paths.get(kind)
+        panel = self._analysis_panels.get(kind)
+        if not path or not panel:
+            return
         path = Path(path)
         if not path.is_file():
             return
-        self.chart_label.update_idletasks()
-        max_w = max(self.chart_label.winfo_width() - 4, 640)
-        max_h = max(self.chart_label.winfo_height() - 4, 320)
+        label = panel["chart_label"]
+        label.update_idletasks()
+        max_w = max(label.winfo_width() - 4, 640)
+        max_h = max(label.winfo_height() - 4, 220)
         with Image.open(path) as im:
             display = im.convert("RGB")
             src_w, src_h = display.size
             scale = min(max_w / src_w, max_h / src_h)
             new_size = (max(1, int(src_w * scale)), max(1, int(src_h * scale)))
             display = display.resize(new_size, Image.Resampling.LANCZOS)
-            self._chart_photo = ImageTk.PhotoImage(display)
-        self.chart_label.configure(image=self._chart_photo, text="")
+            self._chart_photos[kind] = ImageTk.PhotoImage(display)
+        label.configure(image=self._chart_photos[kind], text="")
 
-    def _render_chart(self, report, run_dir: Path | None = None) -> None:
+    def _render_all_charts(self, report, run_dir: Path | None = None) -> None:
+        target = run_dir or self._last_report_run_dir or default_data_dir()
+        target.mkdir(parents=True, exist_ok=True)
+        paths = chart_paths(target)
+        specs = (
+            (
+                "gate",
+                report.gate,
+                paths["gate"],
+                "Gate model analysis",
+                (
+                    f"{report.gate_class_count}-class gate · "
+                    + ", ".join(report.gate_classes or [])
+                    + f" · {report.gate.correct}/{report.gate.evaluated}"
+                ),
+                report.gate_classes or GATE_CLASS_ORDER,
+            ),
+            (
+                "classifier",
+                report.classifier,
+                paths["classifier"],
+                "Plant disease classifier analysis",
+                (
+                    f"{report.classifier.correct}/{report.classifier.evaluated} CNN · "
+                    "SKIP excluded"
+                ),
+                CLASSIFIER_CLASS_ORDER,
+            ),
+            (
+                "pipeline",
+                report.pipeline,
+                paths["pipeline"],
+                "Overall pipeline analysis",
+                (
+                    f"{report.pipeline.correct}/{report.pipeline.evaluated} pipeline · "
+                    f"{report.pipeline.skipped} gate-SKIP"
+                ),
+                PIPELINE_CLASS_ORDER,
+            ),
+        )
+        for kind, metrics, out_file, title, footnote, preferred in specs:
+            self._render_metrics_chart(
+                kind,
+                metrics,
+                out_file,
+                title,
+                footnote,
+                preferred,
+                always_include_preferred=(kind == "gate"),
+            )
+        # Keep chart.png as a copy of the pipeline figure for older runs.
+        try:
+            import shutil
+
+            shutil.copy2(str(paths["pipeline"]), str(chart_path(target)))
+        except OSError:
+            pass
+
+    def _render_metrics_chart(
+        self,
+        kind: str,
+        metrics: ModelMetrics,
+        out_file: Path,
+        title: str,
+        footnote: str,
+        preferred,
+        always_include_preferred: bool = False,
+    ) -> None:
+        panel = self._analysis_panels[kind]
+        label = panel["chart_label"]
         try:
             import matplotlib
 
@@ -659,22 +816,17 @@ class AATBSApp(tk.Tk):
             from matplotlib.colors import LinearSegmentedColormap
             import numpy as np
         except ImportError:
-            self.chart_label.configure(image="", text="Install matplotlib to see charts.")
+            label.configure(image="", text="Install matplotlib to see charts.")
             return
 
-        labels, _ = confusion_matrix_labels(report)
-        if not labels and not report.per_class:
-            self.chart_label.configure(image="", text="No evaluated samples.")
+        labels, matrix = confusion_matrix_from(
+            metrics.confusion,
+            preferred,
+            always_include_preferred=always_include_preferred,
+        )
+        if not labels and not metrics.per_class:
+            label.configure(image="", text="No evaluated samples.")
             return
-
-        preferred = ["bacterial", "fungal", "healthy", "pest", "viral", "others", "non_leaf", "SKIP"]
-        ordered = [c for c in preferred if c in labels]
-        ordered.extend(c for c in labels if c not in ordered)
-        labels = ordered
-        matrix = [
-            [int(report.confusion.get(gt, {}).get(pred, 0)) for pred in labels]
-            for gt in labels
-        ]
 
         fig = Figure(figsize=(14, 5.4), dpi=120, facecolor="white")
         gs = fig.add_gridspec(1, 3, width_ratios=[1.0, 1.55, 1.7], wspace=0.32)
@@ -682,9 +834,8 @@ class AATBSApp(tk.Tk):
         ax_cm = fig.add_subplot(gs[0, 1])
         ax_bar = fig.add_subplot(gs[0, 2])
 
-        overall = report.overall_accuracy
+        overall = metrics.overall_accuracy
 
-        # ---- Overall accuracy (vertical bar, same style as per-class) ----
         overall_bar = ax_overall.bar(
             ["Overall"],
             [overall],
@@ -711,7 +862,7 @@ class AATBSApp(tk.Tk):
         ax_overall.text(
             0.5,
             -0.16,
-            f"{report.correct}/{report.evaluated} pipeline · {report.skipped} gate-SKIP",
+            footnote,
             ha="center",
             va="top",
             fontsize=8,
@@ -759,10 +910,10 @@ class AATBSApp(tk.Tk):
             ax_cm.set_title("Confusion matrix (no data)")
             ax_cm.axis("off")
 
-        classes = list(report.per_class.keys())
+        classes = list(metrics.per_class.keys())
         bar_classes = [c for c in preferred if c in classes]
         bar_classes.extend(c for c in classes if c not in bar_classes)
-        values = [report.per_class[c]["accuracy"] for c in bar_classes]
+        values = [metrics.per_class[c]["accuracy"] for c in bar_classes]
         if bar_classes:
             bars = ax_bar.bar(bar_classes, values, color=ACCENT, edgecolor=ACCENT_DARK, width=0.65)
             ax_bar.set_ylim(0, 1.05)
@@ -801,17 +952,16 @@ class AATBSApp(tk.Tk):
             ax_bar.set_title("Per-class accuracy (no data)")
             ax_bar.axis("off")
 
-        fig.subplots_adjust(left=0.05, right=0.98, top=0.90, bottom=0.24, wspace=0.30)
+        fig.suptitle(title, fontsize=13, fontweight="bold", color=ACCENT_DARK, y=0.98)
+        fig.subplots_adjust(left=0.05, right=0.98, top=0.86, bottom=0.24, wspace=0.30)
 
-        target = run_dir or self._last_report_run_dir or default_data_dir()
-        target.mkdir(parents=True, exist_ok=True)
-        out_file = chart_path(target) if (run_dir or self._last_report_run_dir) else target / "chart.png"
+        out_file = Path(out_file)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_file, facecolor="white")
         fig.clear()
 
-        self._chart_source_path = out_file
-        self._fit_chart_to_panel(out_file)
-
+        self._chart_source_paths[kind] = out_file
+        self._fit_chart_to_panel(kind)
 
 
 def run_app() -> None:
